@@ -35,6 +35,7 @@ class RowModel:
     line2_accent: bool = False
     category: Optional[str] = None
     done_enabled: bool = True
+    restorable: bool = True           # в истории: можно ли вернуть (повторяющиеся — нельзя)
 
 
 def row_from_reminder(r: Reminder, now: datetime) -> RowModel:
@@ -51,7 +52,8 @@ def row_from_reminder(r: Reminder, now: datetime) -> RowModel:
 def row_from_history(h: HistoryItem, now: datetime) -> RowModel:
     return RowModel(
         id=h.id, kind=HISTORY, title=h.title, priority=h.priority, line1=i18n.fmt_due(h.due, now),
-        repeat=i18n.repeat_label(h.repeat), line2=i18n.tr("h_completed", when=i18n.fmt_due(h.completed_at, now)),
+        repeat=i18n.repeat_label(h.repeat), restorable=h.repeat == core.ONCE,
+        line2=i18n.tr("h_completed", when=i18n.fmt_due(h.completed_at, now)),
         category=h.category)
 
 
@@ -85,8 +87,10 @@ class Row(QWidget):
             cb = QCheckBox(self); cb.setChecked(checked); cb.setFixedSize(20, 20)
             cb.toggled.connect(lambda v: self.act.emit("check" if v else "uncheck", model.id))
             self.lead = cb
-            self.btn_a = IconButton("restore", parent=self)
-            self.btn_a.clicked.connect(lambda: self.act.emit("restore", model.id))
+            self.btn_a = None
+            if model.restorable:
+                self.btn_a = IconButton("restore", parent=self)
+                self.btn_a.clicked.connect(lambda: self.act.emit("restore", model.id))
             self.btn_b = IconButton("trash", danger=True, parent=self)
         self.btn_b.clicked.connect(lambda: self.act.emit("delete", model.id))
         self.setContextMenuPolicy(Qt.NoContextMenu)
@@ -95,7 +99,8 @@ class Row(QWidget):
         w, h = self.width(), self.height()
         self.lead.move(PAD + (28 - self.lead.width()) // 2, (h - self.lead.height()) // 2)
         self.btn_b.move(w - PAD - 28, h - 8 - 28)
-        self.btn_a.move(w - PAD - 28 * 2 - 4, h - 8 - 28)
+        if self.btn_a:
+            self.btn_a.move(w - PAD - 28 * 2 - 4, h - 8 - 28)
 
     def text_x(self) -> int:
         return PAD + 28 + PAD

@@ -22,9 +22,10 @@ RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 THEME_KEY = r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"
 
 DEFAULT_SETTINGS: dict[str, Any] = {
-    "language": "en", "theme": "light", "autostart": False, "sound": True,
+    "language": "en", "theme": "light", "autostart": False, "sound": True, "check_updates": True,
     "history_days": 0, "geometry": "", "maximized": False, "last_page": "all",
     "last_category": None, "tray_hint_shown": False,
+    "sort_all": "manual", "sort_cat": "manual", "sort_per_cat": False, "sort_cats": {},
     "quiet_on": False, "quiet_from": "22:00", "quiet_to": "08:00",
 }
 
@@ -135,7 +136,8 @@ CREATE TABLE IF NOT EXISTS reminders(
   id TEXT PRIMARY KEY, title TEXT NOT NULL, description TEXT NOT NULL, category TEXT,
   priority TEXT NOT NULL, anchor TEXT NOT NULL, due TEXT NOT NULL, repeat TEXT NOT NULL,
   snoozed_until TEXT, state TEXT NOT NULL, ord INTEGER NOT NULL,
-  silent INTEGER NOT NULL DEFAULT 0, early_min INTEGER NOT NULL DEFAULT 0, pre_sent TEXT);
+  silent INTEGER NOT NULL DEFAULT 0, early_min INTEGER NOT NULL DEFAULT 0, pre_sent TEXT,
+  cord INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS history(
   id TEXT PRIMARY KEY, title TEXT NOT NULL, category TEXT, priority TEXT NOT NULL,
   due TEXT NOT NULL, completed_at TEXT NOT NULL, repeat TEXT NOT NULL);
@@ -143,13 +145,14 @@ CREATE INDEX IF NOT EXISTS history_completed ON history(completed_at);
 CREATE TABLE IF NOT EXISTS categories(name TEXT PRIMARY KEY, pos INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
 """
-R_COLS, H_COLS = 14, 7
-R_MIGRATE = (("silent", "INTEGER NOT NULL DEFAULT 0"), ("early_min", "INTEGER NOT NULL DEFAULT 0"), ("pre_sent", "TEXT"))
+R_COLS, H_COLS = 15, 7
+R_MIGRATE = (("silent", "INTEGER NOT NULL DEFAULT 0"), ("early_min", "INTEGER NOT NULL DEFAULT 0"), ("pre_sent", "TEXT"),
+             ("cord", "INTEGER NOT NULL DEFAULT 0"))
 
 
 def _reminder_row(r: Reminder, pos: int) -> tuple:
     return (r.id, r.title, r.description, r.category, r.priority, iso(r.anchor), iso(r.due), r.repeat,
-            iso(r.snoozed_until), r.state, pos, int(r.silent), r.early_min, r.pre_sent)
+            iso(r.snoozed_until), r.state, pos, int(r.silent), r.early_min, r.pre_sent, r.cat_order)
 
 
 def _history_row(h: HistoryItem) -> tuple:
@@ -261,7 +264,7 @@ class Storage:
         self.conn.commit()
         reminders = []
         for row in self.conn.execute("SELECT * FROM reminders ORDER BY ord"):
-            d = dict(row); d["order"] = d.pop("ord"); reminders.append(d)
+            d = dict(row); d["order"] = d.pop("ord"); d["cat_order"] = d.pop("cord"); reminders.append(d)
         history = [dict(r) for r in self.conn.execute("SELECT * FROM history")]
         cats = [r["name"] for r in self.conn.execute("SELECT name FROM categories ORDER BY pos")]
         self.data = Data.from_dict({"reminders": reminders, "categories": cats, "history": history})

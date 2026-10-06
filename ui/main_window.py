@@ -6,9 +6,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from PyQt5.QtCore import QByteArray, QPoint, QRectF, QSize, Qt, QTimer, pyqtSignal
-from PyQt5.QtGui import QFontMetrics, QKeySequence, QPainter
-from PyQt5.QtWidgets import (QAbstractButton, QApplication, QDialog, QFileDialog, QHBoxLayout, QMainWindow,
+from PyQt5.QtCore import QByteArray, QObject, QPoint, QRectF, QSize, Qt, QTimer, pyqtSignal
+from PyQt5.QtGui import QBrush, QFontMetrics, QImage, QKeySequence, QPainter, QPixmap, QRegion
+from PyQt5.QtWidgets import (QAbstractButton, QApplication, QDialog, QFileDialog, QHBoxLayout, QLabel, QMainWindow,
                              QScrollArea, QShortcut, QStackedWidget, QVBoxLayout, QWidget)
 
 import core
@@ -20,15 +20,19 @@ from core import (F_ALL, F_CATEGORY, F_OVERDUE, F_TODAY, Filter, Reminder)
 from scheduler import Scheduler
 from storage import Storage
 from theme import S
+from updater import FOUND, UpdateResult, Updater
+from ui.about_dialog import AboutDialog
 from ui.reminder_dialog import ReminderDialog
-from ui.reminder_list import ReminderList, row_from_history, row_from_reminder
+from ui.backdrop import BLUR_PAD, BLUR_RADIUS, SOLID, blur_image, detect_mode
+from ui.reminder_list import ReminderList, _DropLine, row_from_history, row_from_reminder
 from ui.settings_page import SettingsPage
 from ui.toast import ToastManager
 from ui.tray import Tray
-from ui.widgets import (AeroButton, AeroMenu, GlassPanel, HoverAnim, SearchEdit, ask_text, confirm, info, make_label,
-                        paint_focus_ring)
+from ui.update_dialog import UpdateDialog
+from ui.widgets import (AeroButton, AeroMenu, GlassPanel, HoverAnim, SearchEdit, SortButton, ask_text, confirm, info,
+                        make_label, paint_focus_ring)
 
-HISTORY, SETTINGS = "history", "settings"
+HISTORY, SETTINGS, ABOUT = "history", "settings", "about"
 NavKey = tuple  # (вид,) или ("category", имя)
 
 
@@ -59,6 +63,9 @@ class NavItem(QAbstractButton):
     def __init__(self, key: NavKey, icon: str, text: str = "", parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self.key, self._icon, self._text, self._count = key, icon, text, None
+        self.reorder: Optional["CategoryReorder"] = None   # у категорий — контроллер перетаскивания
+        self.dragging = False                               # тянется: тускнеет на месте (как строка списка)
+        self.lifted = False                                 # рисуется «выделенной» — для призрака при перетаскивании
         self.setCheckable(True)
         self.setFocusPolicy(Qt.TabFocus)
         self.setCursor(Qt.PointingHandCursor)
@@ -83,25 +90,142 @@ class NavItem(QAbstractButton):
     def contextMenuEvent(self, e: object) -> None:
         self.context_requested.emit(e.globalPos())  # type: ignore[attr-defined]
 
+    def mousePressEvent(self, e: Any) -> None:
+        if self.reorder and e.button() == Qt.LeftButton:
+            self.reorder.pressed(self, e)
+        super().mousePressEvent(e)
+
+    def mouseMoveEvent(self, e: Any) -> None:
+        super().mouseMoveEvent(e)
+        if self.reorder:
+            self.reorder.moved(self, e)
+
+    def mouseReleaseEvent(self, e: Any) -> None:
+        if self.reorder and self.reorder.released(self):
+            self.setDown(False); return          # перетаскивание — это не клик по пункту
+        super().mouseReleaseEvent(e)
+
     def paintEvent(self, _e: object) -> None:
         p = QPainter(self)
+        base = .35 if self.dragging else 1.0
+        p.setOpacity(base)
         r = QRectF(self.rect()).adjusted(2, 1, -2, -1)
-        if self.isChecked():
+        on = self.isChecked() or self.lifted
+        if on:
             theme.paint_control(p, r, "sel")
         elif self._hover.value > 0:
-            p.setOpacity(self._hover.value * .75); theme.paint_control(p, r, "sel"); p.setOpacity(1.0)
+            p.setOpacity(self._hover.value * .75); theme.paint_control(p, r, "sel"); p.setOpacity(base)
         if self.hasFocus():
             paint_focus_ring(p, r)
         icons.draw_icon(p, self._icon, QRectF(14, 8, 16, 16),
-                        theme.col("icon_on") if self.isChecked() else theme.col("dim"))
+                        theme.col("icon_on") if on else theme.col("dim"))
         right = self.width() - 12
         if self._count is not None:
             cw = QFontMetrics(self.font()).horizontalAdvance(str(self._count))
             p.setPen(theme.col("dim")); p.drawText(QRectF(right - cw, 0, cw, self.height()), Qt.AlignVCenter | Qt.AlignRight, str(self._count))
             right -= cw + 8
-        p.setPen(theme.col("sel_text" if self.isChecked() else "text"))
+        p.setPen(theme.col("sel_text" if on else "text"))
         p.drawText(QRectF(40, 0, right - 40, self.height()), Qt.AlignVCenter | Qt.AlignLeft,
                    QFontMetrics(self.font()).elidedText(self._text, Qt.ElideRight, int(right - 40)))
+
+
+class CategoryReorder(QObject):
+    """Перетаскивание категорий в сайдбаре — тот же механизм, что в списке напоминаний:
+    призрак под курсором, линия вставки, тусклый оригинал, автопрокрутка у краёв."""
+    reordered = pyqtSignal(list)   # новый порядок имён категорий
+
+    def __init__(self, area: QScrollArea, content: QWidget) -> None:
+        super().__init__(area)
+        self.area, self.content = area, content
+        self._items: list[NavItem] = []
+        self._press: Optional[NavItem] = None
+        self._press_pos = QPoint()
+        self._dragging = False
+        self._ghost: Optional[QLabel] = None
+        self._line = _DropLine(content); self._line.hide()
+        self._drop_index = 0
+        self._scroll_dir = 0
+        self._scroll_timer = QTimer(self); self._scroll_timer.setInterval(30)
+        self._scroll_timer.timeout.connect(self._autoscroll)
+
+    def set_items(self, items: list[NavItem]) -> None:
+        self._cancel()
+        self._items = items
+        for it in items:
+            it.reorder = self
+
+    def pressed(self, item: NavItem, e: Any) -> None:
+        self._press, self._press_pos = item, e.globalPos()
+
+    def moved(self, item: NavItem, e: Any) -> None:
+        if self._press is not item or len(self._items) < 2:
+            return
+        gp = e.globalPos()
+        if not self._dragging and (gp - self._press_pos).manhattanLength() >= QApplication.startDragDistance():
+            self._begin(item)
+        if self._dragging:
+            self._update(gp)
+
+    def _begin(self, item: NavItem) -> None:
+        self._dragging = True
+        dpr = item.devicePixelRatioF()
+        pm = QPixmap(int(item.width() * dpr), int(item.height() * dpr))
+        pm.setDevicePixelRatio(dpr); pm.fill(Qt.transparent)
+        item.lifted = True
+        item.render(pm, QPoint(), QRegion(), QWidget.DrawChildren)
+        item.lifted = False
+        self._ghost = QLabel(self.area.viewport())
+        self._ghost.setPixmap(pm); self._ghost.setFixedSize(item.size())
+        self._ghost.setAttribute(Qt.WA_TranslucentBackground)
+        self._ghost.setAttribute(Qt.WA_TransparentForMouseEvents); self._ghost.show()
+        item.dragging = True; item.update()
+        self._line.setParent(self.content); self._line.show(); self._line.raise_()
+
+    def _update(self, gp: QPoint) -> None:
+        assert self._press is not None and self._ghost is not None
+        pos = self.content.mapFromGlobal(gp)
+        vp = self.area.viewport().mapFromGlobal(gp)
+        vh = self.area.viewport().height()
+        gy = max(0, min(vh - self._ghost.height(), vp.y() - self._ghost.height() // 2))
+        self._ghost.move(self._press.x(), gy); self._ghost.raise_()
+        others = [it for it in self._items if it is not self._press]
+        self._drop_index = sum(1 for it in others if it.geometry().center().y() < pos.y())
+        y = others[0].geometry().top() - 3 if self._drop_index == 0 else others[self._drop_index - 1].geometry().bottom()
+        self._line.setGeometry(8, y, self.content.width() - 16, 4); self._line.raise_()
+        self._scroll_dir = -1 if vp.y() < 28 else (1 if vp.y() > vh - 28 else 0)
+        if self._scroll_dir and not self._scroll_timer.isActive():
+            self._scroll_timer.start()
+
+    def _autoscroll(self) -> None:
+        if not self._dragging or not self._scroll_dir:
+            self._scroll_timer.stop(); return
+        bar = self.area.verticalScrollBar()
+        bar.setValue(bar.value() + 14 * self._scroll_dir)
+        self._update(self.area.cursor().pos())
+
+    def released(self, item: NavItem) -> bool:
+        """True — это было перетаскивание (клик по пункту засчитывать не нужно)."""
+        if not (self._dragging and self._press is item):
+            self._press = None
+            return False
+        others = [it.key[1] for it in self._items if it is not item]
+        new = others[:self._drop_index] + [item.key[1]] + others[self._drop_index:]
+        old = [it.key[1] for it in self._items]
+        self._cancel()
+        if new != old:
+            self.reordered.emit(new)
+        return True
+
+    def _cancel(self) -> None:
+        self._scroll_timer.stop()
+        if self._ghost is not None:
+            self._ghost.hide(); self._ghost.deleteLater(); self._ghost = None
+        self._line.hide()
+        for it in self._items:
+            if it.dragging:
+                it.dragging = False; it.update()
+        self._dragging = False
+        self._press = None
 
 
 class UndoBar(QWidget):
@@ -115,13 +239,45 @@ class UndoBar(QWidget):
         self.btn.clicked.connect(self._undo)
         self._timer = QTimer(self); self._timer.setSingleShot(True); self._timer.setInterval(core.UNDO_MS)
         self._timer.timeout.connect(self.hide)
+        self._pix: Optional[QPixmap] = None                # размытое содержимое окна под плашкой
+        self._blur_on = detect_mode() != SOLID
+        self._blur_timer = QTimer(self); self._blur_timer.setInterval(100)   # список под плашкой может прокручиваться
+        self._blur_timer.timeout.connect(self._refresh_blur)
         self.setFixedSize(380, 44); self.hide()
+
+    def _refresh_blur(self) -> None:
+        """Снимок окна под плашкой (фон + список, без самой плашки) → размытие → кэш для paintEvent."""
+        page, win = self.parentWidget(), self.window()
+        central = win.centralWidget() if hasattr(win, "centralWidget") else None
+        if not self._blur_on or central is None or not self.isVisible():
+            return
+        pad, dpr = BLUR_PAD, self.devicePixelRatioF()
+        area = self.rect().adjusted(-pad, -pad, pad, pad)
+        img = QImage(int(area.width() * dpr), int(area.height() * dpr), QImage.Format_ARGB32_Premultiplied)
+        img.setDevicePixelRatio(dpr); img.fill(Qt.transparent)
+        origin = self.mapTo(central, area.topLeft())
+        p = QPainter(img)
+        p.translate(-origin)
+        theme.paint_window_background(p, QRectF(central.rect()))
+        p.translate(page.list.mapTo(central, QPoint()))
+        page.list.render(p, QPoint(), QRegion(), QWidget.DrawChildren)
+        p.end()
+        img.setDevicePixelRatio(1.0)
+        blurred = blur_image(img, BLUR_RADIUS * dpr)
+        crop = blurred.copy(round(pad * dpr), round(pad * dpr), round(self.width() * dpr), round(self.height() * dpr))
+        crop.setDevicePixelRatio(dpr)
+        self._pix = QPixmap.fromImage(crop); self.update()
 
     def offer(self, text: str, undo: Callable[[], None]) -> None:
         self._text, self._cb = text, undo
         self.btn.setText(i18n.tr("undo")); self.btn.adjustSize()
         self.btn.move(self.width() - 12 - self.btn.width(), (self.height() - self.btn.height()) // 2)
-        self.show(); self.raise_(); self._timer.start(); self.update()
+        self.show(); self.raise_(); self._timer.start()
+        self._refresh_blur(); self._blur_timer.start()
+
+    def hideEvent(self, e: object) -> None:
+        self._blur_timer.stop(); self._pix = None
+        super().hideEvent(e)  # type: ignore[arg-type]
 
     def _undo(self) -> None:
         self._timer.stop(); self.hide()
@@ -131,7 +287,12 @@ class UndoBar(QWidget):
 
     def paintEvent(self, _e: object) -> None:
         p = QPainter(self)
-        theme.paint_glass_panel(p, QRectF(self.rect()))
+        r = QRectF(self.rect())
+        if self._pix is not None:                          # размытый фон — текст списка под плашкой не просвечивает
+            p.setRenderHint(QPainter.Antialiasing); p.setPen(Qt.NoPen)
+            p.setBrush(QBrush(self._pix)); p.drawRoundedRect(r.adjusted(.5, .5, -.5, -.5), S.R_PANEL, S.R_PANEL)
+        fill = theme.col("menu"); fill.setAlpha(150 if self._pix is not None else 255)
+        theme.paint_glass_panel(p, r, fill=fill)
         p.setPen(theme.col("text"))
         p.drawText(QRectF(16, 0, self.width() - 120, self.height()), Qt.AlignVCenter | Qt.AlignLeft, self._text)
 
@@ -158,6 +319,8 @@ class MainWindow(QMainWindow):
         self.store, self.sched, self.toasts, self.tray = store, sched, toasts, tray
         self.data = store.data
         self._quitting = False
+        self.updater = Updater(self)
+        self.updater.done.connect(self.on_update_result)
         self.key: NavKey = (F_ALL,)
         self.setWindowIcon(icons.app_icon())
         self.setMinimumSize(*S.WIN_MIN)
@@ -207,15 +370,22 @@ class MainWindow(QMainWindow):
         inner = QWidget(); self.cat_lay = QVBoxLayout(inner)
         self.cat_lay.setContentsMargins(0, 0, 0, 0); self.cat_lay.setSpacing(2); self.cat_lay.addStretch(1)
         self.cat_area.setWidget(inner)
+        self.cat_reorder = CategoryReorder(self.cat_area, inner)
+        self.cat_reorder.reordered.connect(self.on_categories_reorder)
         lay.addWidget(self.cat_area, 1)
         sep = make_label(); sep.setProperty("role", "separator"); sep.setFixedHeight(1)
         lay.addWidget(sep)
         lay.addWidget(self._nav((HISTORY,), "history")); lay.addWidget(self._nav((SETTINGS,), "settings"))
+        lay.addWidget(self._nav((ABOUT,), "info", self.show_about))   # не страница, а кнопка: открывает окно
         return panel
 
-    def _nav(self, key: NavKey, icon: str) -> NavItem:
+    def _nav(self, key: NavKey, icon: str, action: Optional[Callable[[], None]] = None) -> NavItem:
         item = NavItem(key, icon)
-        item.clicked.connect(lambda: self.go(key))
+        if action:
+            item.setCheckable(False)       # пункт-действие не «залипает» выбранным
+            item.clicked.connect(lambda _c=False: action())
+        else:
+            item.clicked.connect(lambda: self.go(key))
         self.nav[key] = item
         return item
 
@@ -228,12 +398,13 @@ class MainWindow(QMainWindow):
         head.addLayout(titles, 1)
         self.search = SearchEdit(); self.search.setFixedWidth(240)
         self.search.textChanged.connect(self.refresh)
+        self.btn_sort = SortButton(); self.btn_sort.clicked.connect(self.sort_menu)
         self.plus = AeroButton("", "accent"); self.plus.set_glyph("plus"); self.plus.setFixedSize(28, 28)
         self.plus.clicked.connect(self.new_reminder)
         self.btn_del_sel = AeroButton("", "ctl"); self.btn_clear = AeroButton("", "danger")
         self.btn_del_sel.clicked.connect(self.delete_selected_history)
         self.btn_clear.clicked.connect(self.clear_history)
-        for w in (self.search, self.plus, self.btn_del_sel, self.btn_clear):
+        for w in (self.search, self.btn_sort, self.plus, self.btn_del_sel, self.btn_clear):
             head.addWidget(w, 0, Qt.AlignVCenter)
         col.addLayout(head)
 
@@ -261,11 +432,13 @@ class MainWindow(QMainWindow):
         tr = i18n.tr
         self.setWindowTitle(tr("app_title"))
         for key, name in (((F_ALL,), "nav_all"), ((F_TODAY,), "nav_today"), ((F_OVERDUE,), "nav_overdue"),
-                          ((HISTORY,), "nav_history"), ((SETTINGS,), "nav_settings")):
+                          ((HISTORY,), "nav_history"), ((SETTINGS,), "nav_settings"), ((ABOUT,), "nav_about")):
             self.nav[key].set_text(tr(name))
         self.cat_label.setText(tr("nav_categories"))
         self.search.setPlaceholderText(tr("search_ph"))
         self.btn_clear.setText(tr("h_clear"))
+        self.btn_sort.setToolTip(tr("sort_tip"))
+        self.btn_sort.fit([tr(f"sort_{m}") for m in core.SORTS])
         self.settings_page.retranslate()
         self.refresh()
 
@@ -296,12 +469,56 @@ class MainWindow(QMainWindow):
                 item.context_requested.connect(lambda pos, n=name: self.category_menu(n, pos))
                 self.nav[(F_CATEGORY, name)] = item
                 self.cat_lay.insertWidget(self.cat_lay.count() - 1, item)
+            self.cat_reorder.set_items([self.nav[(F_CATEGORY, n)] for n in names])
         self.cat_label.setVisible(bool(names))   # область категорий остаётся в раскладке: она поглощает свободную высоту
 
     def _page_title(self) -> str:
         tr, kind = i18n.tr, self.key[0]
         return {F_ALL: tr("nav_all"), F_TODAY: tr("nav_today"), F_OVERDUE: tr("nav_overdue"),
                 HISTORY: tr("nav_history"), SETTINGS: tr("nav_settings")}.get(kind) or str(self.key[1])
+
+    # ---- сортировка: общий список и категории хранятся раздельно
+    def sort_mode(self) -> str:
+        s = self.store.settings
+        if self.key[0] == F_CATEGORY:
+            mode = s.get("sort_cat")
+            if s.get("sort_per_cat"):
+                mode = (s.get("sort_cats") or {}).get(self.key[1], mode)
+        else:
+            mode = s.get("sort_all")
+        return mode if mode in core.SORTS else core.MANUAL
+
+    def set_sort_mode(self, mode: str) -> None:
+        if self.key[0] != F_CATEGORY:
+            self.store.set(sort_all=mode)
+        elif self.store.settings.get("sort_per_cat"):
+            self.store.set(sort_cats={**(self.store.settings.get("sort_cats") or {}), self.key[1]: mode})
+        else:
+            self.store.set(sort_cat=mode)
+        self.refresh()
+
+    def sort_menu(self) -> None:
+        menu = AeroMenu(self)
+        cur = self.sort_mode()
+        for mode in core.SORTS:
+            act = menu.addAction(i18n.tr(f"sort_{mode}"), lambda m=mode: self.set_sort_mode(m))
+            act.setCheckable(True); act.setChecked(mode == cur)
+        b = self.btn_sort
+        pos = b.mapToGlobal(QPoint(b.width() - menu.sizeHint().width() + S.SHADOW, b.height() + 2 - S.SHADOW))
+        menu.exec_(pos)
+
+    def _forget_sort(self, name: str, new: Optional[str] = None) -> None:
+        """Режим сортировки категории следует за ней при переименовании и удаляется вместе с ней."""
+        cats = dict(self.store.settings.get("sort_cats") or {})
+        if name in cats:
+            mode = cats.pop(name)
+            if new:
+                cats[new] = mode
+            self.store.set(sort_cats=cats)
+
+    def on_categories_reorder(self, names: list) -> None:
+        core.reorder_categories(self.data, names)
+        self._commit()
 
     # ---- обновление
     def refresh(self, *_a: object) -> None:
@@ -321,7 +538,7 @@ class MainWindow(QMainWindow):
         kind = self.key[0]
         self.title.setText(self._page_title())
         on_list, on_hist = self._is_list_page(), kind == HISTORY
-        for w in (self.search, self.plus):
+        for w in (self.search, self.btn_sort, self.plus):
             w.setVisible(on_list)
         for w in (self.btn_del_sel, self.btn_clear):
             w.setVisible(on_hist)
@@ -329,8 +546,10 @@ class MainWindow(QMainWindow):
         tr = i18n.tr
         if on_list:
             query = self.search.text()
-            rows = core.visible(self.data, self.flt, now, query)
-            self.list.drag_enabled = kind in (F_ALL, F_CATEGORY)
+            mode = self.sort_mode()
+            self.btn_sort.setText(tr(f"sort_{mode}"))
+            rows = core.visible(self.data, self.flt, now, query, mode)
+            self.list.drag_enabled = mode == core.MANUAL and kind in (F_ALL, F_CATEGORY)
             # подсказка «Нажмите +» осмысленна только там, где «+» добавляет прямо сюда
             hint = tr("empty_hint") if kind in (F_ALL, F_CATEGORY) and not query else ""
             self.list.set_items([row_from_reminder(r, now) for r in rows],
@@ -409,7 +628,7 @@ class MainWindow(QMainWindow):
             self.toasts.show_alerts([r])
 
     def on_reorder(self, ids: list[str]) -> None:
-        core.reorder_subset(self.data, ids)
+        core.reorder_subset(self.data, ids, self.key[0] == F_CATEGORY)
         self.store.save_data(); self.refresh()
 
     def snooze(self, rid: str, until: datetime) -> None:
@@ -422,7 +641,9 @@ class MainWindow(QMainWindow):
         tr = i18n.tr
         menu = AeroMenu(self)
         if self.key[0] == HISTORY:
-            menu.addAction(tr("h_restore"), lambda: self.on_restore(rid))
+            h = next((x for x in self.data.history if x.id == rid), None)
+            if h and h.repeat == core.ONCE:
+                menu.addAction(tr("h_restore"), lambda: self.on_restore(rid))
             menu.addAction(tr("h_delete_forever"), lambda: self.on_delete(rid))
             menu.exec_(pos); return
         r = self.data.get(rid)
@@ -444,7 +665,7 @@ class MainWindow(QMainWindow):
     # ---- история
     def on_restore(self, hid: str) -> None:
         h = next((x for x in self.data.history if x.id == hid), None)
-        if h:
+        if h and h.repeat == core.ONCE:
             core.restore_from_history(self.data, h)
             self.store.save_data(); self.sched.tick(); self.refresh()
 
@@ -469,6 +690,7 @@ class MainWindow(QMainWindow):
         new = ask_text(self, i18n.tr("cat_rename_title"), i18n.tr("cat_name"), name)
         if new and new != name:
             core.rename_category(self.data, name, new)
+            self._forget_sort(name, new)
             if self.key == (F_CATEGORY, name):
                 self.key = (F_CATEGORY, new)
             self._commit()
@@ -476,6 +698,7 @@ class MainWindow(QMainWindow):
     def delete_category(self, name: str) -> None:
         if confirm(self, i18n.tr("confirm_delete_category", name=name), i18n.tr("delete"), danger=True):
             core.delete_category(self.data, name)
+            self._forget_sort(name)
             if self.key == (F_CATEGORY, name):
                 self.key = (F_ALL,)
             self._commit()
@@ -555,8 +778,29 @@ class MainWindow(QMainWindow):
             self.store.set(autostart=bool(value))
         elif key == "history_days":
             self.store.set(history_days=value); self.sched.purge_now()
+        elif key == "sort_per_cat":
+            self.store.set(sort_per_cat=bool(value)); self.refresh()
         else:
             self.store.set(**{key: value})
+
+    def show_about(self) -> None:
+        AboutDialog(self, self.updater).exec_()
+
+    # ---- обновления
+    def check_updates_on_start(self) -> None:
+        """Тихая проверка в фоне при запуске (если включена в настройках)."""
+        if self.store.settings.get("check_updates", True):
+            self.updater.check()
+
+    def on_update_result(self, res: UpdateResult) -> None:
+        """Результат тихой проверки: показываем только найденное обновление, любые ошибки молча игнорируем.
+        Ручную проверку обрабатывает окно «О программе»."""
+        if res.manual or res.status != FOUND or res.release is None:
+            return
+        if QApplication.activeModalWidget() is not None:     # пользователь занят другим диалогом — спросим чуть позже
+            QTimer.singleShot(3000, lambda: self.on_update_result(res))
+            return
+        UpdateDialog(self if self.isVisible() else None, res.release).exec_()
 
     # ---- окно: трей, геометрия, фокус
     def focus_search(self) -> None:

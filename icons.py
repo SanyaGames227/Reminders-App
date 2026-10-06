@@ -117,6 +117,12 @@ def _build_icons() -> dict[str, Callable[[], tuple[list[QPainterPath], list[QPai
     clock_hands = _poly([(8, 4.8), (8, 8), (10.4, 9.4)])
     lst = _lines((5.5, 4.5, 13, 4.5), (5.5, 8, 13, 8), (5.5, 11.5, 13, 11.5))
 
+    heart = QPainterPath(QPointF(8, 13.4))
+    heart.cubicTo(3.0, 10.0, 1.6, 7.6, 1.6, 5.6); heart.cubicTo(1.6, 3.8, 3.0, 2.6, 4.6, 2.6)
+    heart.cubicTo(6.0, 2.6, 7.2, 3.4, 8, 4.8); heart.cubicTo(8.8, 3.4, 10.0, 2.6, 11.4, 2.6)
+    heart.cubicTo(13.0, 2.6, 14.4, 3.8, 14.4, 5.6); heart.cubicTo(14.4, 7.6, 13.0, 10.0, 8, 13.4)
+    heart.closeSubpath()
+
     return {
         "check": stroke(_poly([(3.5, 8.5), (6.7, 11.6), (12.5, 4.6)])),
         "close": stroke(_lines((4, 4, 12, 12), (12, 4, 4, 12))),
@@ -139,7 +145,10 @@ def _build_icons() -> dict[str, Callable[[], tuple[list[QPainterPath], list[QPai
         "today": mixed([cal], [_circle(8, 10, 1.1)]),
         "overdue": mixed([_circle(8, 8, 5.6), _lines((8, 4.8, 8, 8.6))], [_circle(8, 11, 0.9)]),
         "settings": stroke(gear, teeth),
+        "heart": mixed([], [heart]),
+        "info": mixed([_circle(8, 8, 5.6), _lines((8, 7.4, 8, 10.8))], [_circle(8, 5.3, 0.9)]),
         "folder": stroke(folder),
+        "sort": stroke(_lines((2.5, 4.5, 13.5, 4.5), (2.5, 8, 10, 8), (2.5, 11.5, 6.5, 11.5))),
     }
 
 

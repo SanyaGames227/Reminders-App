@@ -125,6 +125,7 @@ def main() -> int:
         for notice in store.notices:
             info(window if window.isVisible() else None, i18n.tr(notice))
         sched.start()
+        window.check_updates_on_start()      # тихо, в фоне; окно появится только если вышла новая версия
     QTimer.singleShot(0, after_start)
     return app.exec_()
 

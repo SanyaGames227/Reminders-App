@@ -1,4 +1,4 @@
-"""Страница настроек: язык, тема, автозапуск, звук, автоочистка истории."""
+"""Страница настроек: язык, тема, обновления, автозапуск, звук, автоочистка истории."""
 from __future__ import annotations
 
 from typing import Any, Optional
@@ -22,10 +22,15 @@ class SettingsPage(QWidget):
     def __init__(self, settings: dict[str, Any], parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self.language = AeroComboBox(); self.theme = AeroComboBox(); self.cleanup = AeroComboBox()
-        self.autostart = QCheckBox(); self.sound = QCheckBox()
+        self.check_updates = QCheckBox(); self.autostart = QCheckBox(); self.sound = QCheckBox()
         self.shortcut = AeroButton("", "ctl", compact=True)
         self.shortcut.setFixedWidth(100)
         self.quiet = QCheckBox()
+        self.sort_per_cat = QCheckBox()
+        self.sort_box = QWidget(); sb = QVBoxLayout(self.sort_box)     # галочка + микро-описание под ней
+        sb.setContentsMargins(0, 0, 0, 0); sb.setSpacing(2)
+        hint = make_label("", "dim"); hint.setWordWrap(True); hint.setContentsMargins(24, 0, 0, 0)
+        sb.addWidget(self.sort_per_cat); sb.addWidget(hint)
         self.q_from, self.q_to = AeroTimeEdit(), AeroTimeEdit()
         for w in (self.q_from, self.q_to):
             w.setDisplayFormat("HH:mm"); w.setFixedWidth(90)
@@ -34,7 +39,7 @@ class SettingsPage(QWidget):
         self.data_row = QWidget(); dr = QHBoxLayout(self.data_row)
         dr.setContentsMargins(0, 0, 0, 0); dr.setSpacing(S.SP)
         dr.addWidget(self.btn_export); dr.addWidget(self.btn_import)
-        self._labels: dict[str, Any] = {}
+        self._labels: dict[str, Any] = {"set_sort_per_cat_hint": hint}
         self._left = (self.shortcut, self.q_from, self.q_to, self.data_row, self.btn_optimize)
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0); root.setSpacing(S.SP * 2)
@@ -42,19 +47,22 @@ class SettingsPage(QWidget):
         def section(key: str, rows: list[tuple[Optional[str], QWidget]]) -> None:
             panel = GlassPanel(); g = QGridLayout(panel)
             g.setContentsMargins(20, 14, 20, 16); g.setHorizontalSpacing(S.SP * 3); g.setVerticalSpacing(S.SP + 4)
-            head = make_label("", "section"); self._labels[key] = head
-            g.addWidget(head, 0, 0, 1, 2)
-            for i, (lk, w) in enumerate(rows, 1):
+            for i, (lk, w) in enumerate(rows):
                 if lk:
                     lb = make_label("", "dim"); self._labels[lk] = lb
                     g.addWidget(lb, i, 0); g.addWidget(w, i, 1, Qt.AlignLeft) if w in self._left else g.addWidget(w, i, 1)
                 else:
                     g.addWidget(w, i, 0, 1, 2)
-            g.setColumnStretch(1, 1); g.setColumnMinimumWidth(0, 160)
-            root.addWidget(panel)
+            g.setColumnStretch(1, 1)
+            if not all(w in self._left for lk, w in rows if lk):    # растянутые комбобоксы — общая колонка подписей;
+                g.setColumnMinimumWidth(0, 160)                      # у компактных контролов отступ = самая длинная подпись
+            head = make_label("", "section"); head.setContentsMargins(6, 0, 0, 4); self._labels[key] = head
+            box = QVBoxLayout(); box.setSpacing(0); box.addWidget(head); box.addWidget(panel)   # заголовок над панелью, слева
+            root.addLayout(box)
 
         section("sec_appearance", [("set_language", self.language), ("set_theme", self.theme)])
-        section("sec_system", [(None, self.autostart), (None, self.sound), ("set_shortcut", self.shortcut)])
+        section("sec_system", [(None, self.check_updates), (None, self.autostart), (None, self.sound), ("set_shortcut", self.shortcut)])
+        section("sec_lists", [(None, self.sort_box)])
         section("sec_quiet", [(None, self.quiet), ("set_quiet_from", self.q_from), ("set_quiet_to", self.q_to)])
         section("sec_history", [("set_cleanup", self.cleanup)])
         section("sec_data", [("set_data", self.data_row), ("set_db", self.btn_optimize)])
@@ -66,8 +74,11 @@ class SettingsPage(QWidget):
         self.language.currentIndexChanged.connect(lambda _i: self.changed.emit("language", self.language.currentData()))
         self.theme.currentIndexChanged.connect(lambda _i: self.changed.emit("theme", self.theme.currentData()))
         self.cleanup.currentIndexChanged.connect(lambda _i: self.changed.emit("history_days", self.cleanup.currentData()))
+        self.check_updates.toggled.connect(lambda v: self.changed.emit("check_updates", v))
         self.autostart.toggled.connect(lambda v: self.changed.emit("autostart", v))
         self.sound.toggled.connect(lambda v: self.changed.emit("sound", v))
+        self.sort_per_cat.setChecked(bool(settings.get("sort_per_cat")))
+        self.sort_per_cat.toggled.connect(lambda v: self.changed.emit("sort_per_cat", v))
         self.shortcut.clicked.connect(lambda _c=False: self.shortcut_requested.emit())
         self.btn_export.clicked.connect(lambda _c=False: self.export_requested.emit())
         self.btn_import.clicked.connect(lambda _c=False: self.import_requested.emit())
@@ -79,6 +90,7 @@ class SettingsPage(QWidget):
         self.quiet.toggled.connect(self._on_quiet)
         self.q_from.timeChanged.connect(lambda t: self.changed.emit("quiet_from", t.toString("HH:mm")))
         self.q_to.timeChanged.connect(lambda t: self.changed.emit("quiet_to", t.toString("HH:mm")))
+        self.check_updates.setChecked(bool(settings.get("check_updates", True)))
         self.autostart.setChecked(bool(settings["autostart"])); self.sound.setChecked(bool(settings["sound"]))
         self._settings = settings
         self.retranslate()
@@ -102,8 +114,10 @@ class SettingsPage(QWidget):
         del blockers
         for key, lb in self._labels.items():
             lb.setText(tr(key))
+        self.check_updates.setText(tr("set_check_updates"))
         self.autostart.setText(tr("set_autostart")); self.sound.setText(tr("set_sound"))
         self.shortcut.setText(tr("shortcut_create")); self.quiet.setText(tr("set_quiet"))
+        self.sort_per_cat.setText(tr("set_sort_per_cat"))
         self.btn_export.setText(tr("data_export")); self.btn_import.setText(tr("data_import"))
         self.btn_optimize.setText(tr("db_optimize"))
 

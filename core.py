@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import calendar
+import re
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, time, timedelta
@@ -22,9 +23,15 @@ SNOOZE_SHORT = timedelta(minutes=10)
 SNOOZE_LONG = timedelta(hours=1)
 TOMORROW_HOUR = 9                       # «завтра 09:00»
 UNDO_MS = 5000                          # время полосы «Отменить»
+MANUAL, BY_TITLE, BY_DUE = "manual", "title", "due"   # режимы сортировки списка
+SORTS = (MANUAL, BY_TITLE, BY_DUE)
 HISTORY_KEEP_CHOICES = (0, 30, 90)      # 0 = никогда не очищать
 EARLY_CHOICES = (0, 5, 10, 15, 30, 60, 120, 1440)   # «напомнить заранее», минуты; 0 = выключено
 EXPORT_FORMAT = "reminders-export"
+APP_VERSION = "1.0.1"
+GITHUB_URL = "https://github.com/SanyaGames227/Reminders-App"
+RELEASES_URL = GITHUB_URL + "/releases"
+RELEASES_API = "https://api.github.com/repos/SanyaGames227/Reminders-App/releases/latest"
 
 # Фильтры списка: (вид, аргумент)
 F_ALL, F_TODAY, F_OVERDUE, F_CATEGORY = "all", "today", "overdue", "category"
@@ -64,6 +71,7 @@ class Reminder:
     snoozed_until: Optional[datetime] = None
     state: str = SCHEDULED
     order: int = 0
+    cat_order: int = 0                   # ручной порядок внутри категории (независим от общего списка)
     silent: bool = False                 # без звука
     early_min: int = 0                   # за сколько минут предупредить (0 — не надо)
     pre_sent: Optional[str] = None       # due, для которого предупреждение уже показано
@@ -79,6 +87,7 @@ class Reminder:
             "category": self.category, "priority": self.priority,
             "anchor": iso(self.anchor), "due": iso(self.due), "repeat": self.repeat,
             "snoozed_until": iso(self.snoozed_until), "state": self.state, "order": self.order,
+            "cat_order": self.cat_order,
             "silent": self.silent, "early_min": self.early_min, "pre_sent": self.pre_sent,
         }
 
@@ -94,7 +103,7 @@ class Reminder:
             repeat=d.get("repeat", ONCE) if d.get("repeat") in REPEATS else ONCE,
             snoozed_until=parse_iso(d.get("snoozed_until")),
             state=d.get("state", SCHEDULED) if d.get("state") in (SCHEDULED, ALERTING, ACKNOWLEDGED) else SCHEDULED,
-            order=int(d.get("order", 0)),
+            order=int(d.get("order", 0)), cat_order=int(d.get("cat_order", 0)),
             silent=bool(d.get("silent", False)),
             early_min=_early(d.get("early_min", 0)),
             pre_sent=d.get("pre_sent") or None,
@@ -154,6 +163,7 @@ class Data:
         )
         data.reminders.sort(key=lambda r: r.order)
         _renumber(data)
+        _renumber_cat(data)
         for r in data.reminders:
             ensure_category(data, r.category)
         return data
@@ -165,6 +175,20 @@ class Data:
 def _renumber(data: Data) -> None:
     for i, r in enumerate(data.reminders):
         r.order = i
+
+
+def _renumber_cat(data: Data) -> None:
+    """Порядок внутри каждой категории: 0..n-1 (при равенстве — по общему порядку)."""
+    groups: dict[Optional[str], list[Reminder]] = {}
+    for r in sorted(data.reminders, key=lambda r: (r.cat_order, r.order)):
+        groups.setdefault(r.category, []).append(r)
+    for rs in groups.values():
+        for i, r in enumerate(rs):
+            r.cat_order = i
+
+
+def _next_cat_order(data: Data, name: Optional[str]) -> int:
+    return max((r.cat_order for r in data.reminders if r.category == name), default=-1) + 1
 
 
 def ensure_category(data: Data, name: Optional[str]) -> None:
@@ -314,6 +338,44 @@ def in_quiet(now: datetime, start: time, end: time) -> bool:
     return start <= t < end if start < end else (t >= start or t < end)
 
 
+# ---- Обновления -------------------------------------------------------------------------
+@dataclass
+class Release:
+    tag: str          # как на GitHub, например «v1.1.0»
+    version: str      # для показа, без «v»: «1.1.0»
+    notes: str        # список изменений (Markdown), может быть пустым
+
+
+def parse_version(s: Any) -> tuple[int, ...]:
+    """«v1.2.3», «1.2.3-beta» → (1, 2, 3). Суффиксы после числовой части игнорируются; нет цифр → ()."""
+    m = re.match(r"\s*[vV]?(\d+(?:\.\d+)*)", str(s))
+    return tuple(int(x) for x in m[1].split(".")) if m else ()
+
+
+def is_newer(remote: Any, local: Any) -> bool:
+    """Версия `remote` строго новее `local` (1.0 и 1.0.0 равны). Непонятная версия — не новее."""
+    a, b = parse_version(remote), parse_version(local)
+    if not a or not b:
+        return False
+    n = max(len(a), len(b))
+    return a + (0,) * (n - len(a)) > b + (0,) * (n - len(b))
+
+
+def parse_release(payload: Any) -> Release:
+    """Ответ GitHub API (releases/latest) → Release. Бросает ValueError, если это не релиз.
+    Черновики и пре-релизы не считаются обновлением."""
+    if not isinstance(payload, dict) or not isinstance(payload.get("tag_name"), str) \
+            or not parse_version(payload["tag_name"]):
+        raise ValueError("not a release")
+    if payload.get("draft") or payload.get("prerelease"):
+        raise ValueError("not a stable release")
+    tag = payload["tag_name"].strip()
+    notes = payload.get("body") if isinstance(payload.get("body"), str) else ""
+    # автогенерируемая строка со ссылкой «Full Changelog» в окне не нужна
+    lines = [ln for ln in notes.replace("\r\n", "\n").split("\n") if not ln.lstrip("*_ ").lower().startswith("full changelog")]
+    return Release(tag=tag, version=tag.lstrip("vV"), notes="\n".join(lines).strip())
+
+
 # ---- Экспорт / импорт ---------------------------------------------------------------------
 def export_payload(data: Data, now: datetime) -> dict[str, Any]:
     return {"format": EXPORT_FORMAT, "version": 1, "exported": iso(now), **data.to_dict()}
@@ -370,6 +432,7 @@ def complete(data: Data, r: Reminder, now: datetime) -> Optional[HistoryItem]:
 
 def add_reminder(data: Data, r: Reminder) -> None:
     r.order = len(data.reminders)
+    r.cat_order = _next_cat_order(data, r.category)
     data.reminders.append(r)
     ensure_category(data, r.category)
     mark_pre_if_late(r, now_local())
@@ -390,6 +453,8 @@ def undo_delete(data: Data, r: Reminder, index: int) -> None:
 
 def apply_edit(data: Data, r: Reminder, *, title: str, description: str, category: Optional[str],
                priority: str, repeat: str, due: datetime, silent: bool = False, early_min: int = 0) -> None:
+    if (category or None) != r.category:
+        r.cat_order = _next_cat_order(data, category or None)     # при смене категории — в её конец
     r.title, r.description, r.category, r.priority = title, description, category or None, priority
     r.silent = silent
     ensure_category(data, r.category)
@@ -414,12 +479,21 @@ def matches(r: Reminder, flt: Filter, now: datetime) -> bool:
     return True
 
 
-def visible(data: Data, flt: Filter, now: datetime, query: str = "") -> list[Reminder]:
+def sort_reminders(items: list[Reminder], mode: str, in_category: bool = False) -> list[Reminder]:
+    """Ручной порядок: общий (order) или внутри категории (cat_order); остальное — по названию / ближайшей дате."""
+    if mode == BY_TITLE:
+        return sorted(items, key=lambda r: (r.title.casefold(), r.order))
+    if mode == BY_DUE:
+        return sorted(items, key=lambda r: (effective_time(r), r.order))
+    return sorted(items, key=lambda r: (r.cat_order if in_category else r.order, r.order))
+
+
+def visible(data: Data, flt: Filter, now: datetime, query: str = "", sort: str = MANUAL) -> list[Reminder]:
     q = query.strip().casefold()
     out = [r for r in data.reminders if matches(r, flt, now)]
     if q:
         out = [r for r in out if q in f"{r.title}\n{r.description}\n{r.category or ''}".casefold()]
-    return out
+    return sort_reminders(out, sort, flt[0] == F_CATEGORY)
 
 
 def counts(data: Data, now: datetime) -> dict[str, Any]:
@@ -431,10 +505,17 @@ def counts(data: Data, now: datetime) -> dict[str, Any]:
     }
 
 
-def reorder_subset(data: Data, new_order_ids: Iterable[str]) -> None:
-    """Элементы подмножества переставляются в уже занимаемых ими позициях общего порядка."""
+def reorder_subset(data: Data, new_order_ids: Iterable[str], in_category: bool = False) -> None:
+    """Элементы подмножества переставляются в уже занимаемых ими позициях порядка.
+    in_category — меняется только порядок внутри категории, общий список не затрагивается."""
     ids = list(new_order_ids)
     by_id = {r.id: r for r in data.reminders}
+    if in_category:
+        chosen = [by_id[i] for i in ids]
+        for slot, r in zip(sorted(r.cat_order for r in chosen), chosen):
+            r.cat_order = slot
+        _renumber_cat(data)
+        return
     slots = sorted(i for i, r in enumerate(data.reminders) if r.id in set(ids))
     for slot, rid in zip(slots, ids):
         data.reminders[slot] = by_id[rid]
@@ -446,14 +527,24 @@ def rename_category(data: Data, old: str, new: str) -> None:
     new = new.strip()
     if not new or new == old:
         return
-    data.categories = [c for c in data.categories if c != old]
-    ensure_category(data, new)
+    if new in data.categories:
+        data.categories = [c for c in data.categories if c != old]
+    else:                                  # переименование не сдвигает категорию в списке
+        data.categories = [new if c == old else c for c in data.categories]
+        ensure_category(data, new)
     for r in data.reminders:
         if r.category == old:
             r.category = new
+    _renumber_cat(data)
     for h in data.history:
         if h.category == old:
             h.category = new
+
+
+def reorder_categories(data: Data, names: Iterable[str]) -> None:
+    names = list(names)
+    if sorted(names) == sorted(data.categories):
+        data.categories = names
 
 
 def delete_category(data: Data, name: str) -> None:
@@ -461,11 +552,14 @@ def delete_category(data: Data, name: str) -> None:
     for r in data.reminders:
         if r.category == name:
             r.category = None
+    _renumber_cat(data)
 
 
 # ---- История -----------------------------------------------------------------------------
 def restore_from_history(data: Data, item: HistoryItem) -> Reminder:
-    """Возвращает запись как ОДНОКРАТНОЕ напоминание с исходной датой."""
+    """Возвращает запись как ОДНОКРАТНОЕ напоминание с исходной датой (повторяющиеся не возвращаются)."""
+    if item.repeat != ONCE:
+        raise ValueError("повторяющееся напоминание нельзя вернуть из истории")
     data.history.remove(item)
     r = Reminder.create(item.title, item.due, category=item.category, priority=item.priority)
     add_reminder(data, r)

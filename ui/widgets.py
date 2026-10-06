@@ -6,7 +6,7 @@ from typing import Optional
 
 from PyQt5.QtCore import (QDate, QEasingCurve, QEvent, QObject, QPoint, QRect, QRectF, QSize, Qt, QTimer,
                           QVariantAnimation, pyqtSignal)
-from PyQt5.QtGui import QColor, QCursor, QFont, QGuiApplication, QLinearGradient, QPainter, QPen, QTextCharFormat
+from PyQt5.QtGui import QBrush, QColor, QCursor, QFont, QFontMetrics, QGuiApplication, QLinearGradient, QPainter, QPen, QTextCharFormat
 from PyQt5.QtWidgets import (QAbstractButton, QApplication, QCalendarWidget, QComboBox, QDialog, QHBoxLayout, QMenu,
                              QLabel, QLineEdit, QListView, QPushButton, QStyledItemDelegate, QTableView,
                              QDateEdit, QTextEdit, QTimeEdit, QVBoxLayout, QWidget)
@@ -16,6 +16,7 @@ import i18n
 import icons
 import theme
 from theme import S
+from ui.backdrop import NATIVE, Backdrop
 
 
 # ---- Анимация наведения ------------------------------------------------------------------------
@@ -178,6 +179,49 @@ class AeroButton(QPushButton):
         p.drawText(r.translated(0, 1 if self.isDown() else 0), Qt.AlignCenter | Qt.TextShowMnemonic, self.text())
 
 
+class SortButton(AeroButton):
+    """Кнопка выбора сортировки: значок, текущий режим и стрелка. Ширина фиксируется под самый длинный вариант."""
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__("", "ctl", parent)
+        self.setFixedHeight(28)
+
+    def fit(self, texts: list[str]) -> None:
+        self._texts = list(texts)
+        self._refit()
+
+    def _refit(self) -> None:
+        """Ширина считается по шрифту, который реально применён (QSS/тема/язык меняют его после создания)."""
+        if getattr(self, "_texts", None):
+            fm = QFontMetrics(self.font())
+            w = max(fm.horizontalAdvance(t) for t in self._texts) + 66
+            if w != self.width():
+                self.setFixedWidth(w)
+
+    def event(self, e: object) -> bool:
+        ok = super().event(e)  # type: ignore[arg-type]
+        if e.type() in (QEvent.Polish, QEvent.StyleChange, QEvent.FontChange, QEvent.Show):  # type: ignore[attr-defined]
+            self._refit()
+        return ok
+
+    def paintEvent(self, _e: object) -> None:
+        p = QPainter(self)
+        r = QRectF(self.rect())
+        theme.paint_control(p, r, "ctl", glow_k=self._hover.value)
+        if self.isDown():
+            p.setPen(Qt.NoPen); p.setBrush(QColor(0, 0, 0, 45)); p.setRenderHint(QPainter.Antialiasing)
+            p.drawRoundedRect(r.adjusted(1, 1, -1, -1), S.R_CTL, S.R_CTL)
+        if self.hasFocus():
+            paint_focus_ring(p, r)
+        h = r.height()
+        icons.draw_icon(p, "sort", QRectF(10, (h - 14) / 2, 14, 14), theme.col("dim"), 1.6)
+        p.setPen(theme.col("text"))
+        tw = int(r.width() - 32 - 26)
+        p.drawText(QRectF(32, 0, tw, h), Qt.AlignVCenter | Qt.AlignLeft,
+                   QFontMetrics(self.font()).elidedText(self.text(), Qt.ElideRight, tw))
+        icons.draw_icon(p, "arrow_down", QRectF(r.width() - 22, (h - 12) / 2, 12, 12), theme.col("dim"), 1.6)
+
+
 class IconButton(QAbstractButton):
     """Иконка-кнопка: приглушённая, при наведении ярче."""
 
@@ -310,12 +354,37 @@ class SearchEdit(QLineEdit):
 
 # ---- Меню ------------------------------------------------------------------------------------------
 class AeroMenu(QMenu):
-    """QMenu с собственной тенью в прозрачном поле (QSS margin = S.SHADOW). Используется везде."""
+    """QMenu с собственной тенью в прозрачном поле (QSS margin = S.SHADOW). Используется везде.
+    Под меню — размытый фон, как у уведомлений (ui/backdrop.py): текст за меню не просвечивает.
+    Заливку-стекло поверх размытия рисует paintEvent, поэтому QSS-фон у меню прозрачный."""
+    RADIUS = 8
+
+    def __init__(self, *args: object) -> None:
+        super().__init__(*args)  # type: ignore[arg-type]
+        self._bd = Backdrop(self, self.RADIUS)
+        self.setStyleSheet("QMenu { background: transparent; }")
+
+    def body(self) -> QRectF:
+        m = S.SHADOW
+        return QRectF(self.rect()).adjusted(m, m, -m, -m)
+
+    def showEvent(self, e: object) -> None:
+        super().showEvent(e)  # type: ignore[arg-type]
+        self._bd.prepare(self.pos())          # снимок экрана до того, как меню появилось на нём
+        if self._bd.mode == NATIVE:
+            self._bd.activate()               # KDE: размытие делает композитор
 
     def paintEvent(self, e: object) -> None:
         p = QPainter(self)
-        m = S.SHADOW
-        theme.paint_shadow(p, QRectF(self.rect()).adjusted(m, m, -m, -m), 8)
+        body = self.body()
+        theme.paint_shadow(p, body, self.RADIUS)
+        p.setRenderHint(QPainter.Antialiasing); p.setPen(Qt.NoPen)
+        r = body.adjusted(.5, .5, -.5, -.5)
+        pix = self._bd.pixmap()
+        if pix is not None:
+            p.setBrushOrigin(body.topLeft()); p.setBrush(QBrush(pix)); p.drawRoundedRect(r, self.RADIUS, self.RADIUS)
+        fill = theme.col("menu"); fill.setAlpha(185 if self._bd.translucent() else 255)   # без размытия — плотная заливка
+        p.setBrush(fill); p.drawRoundedRect(r, self.RADIUS, self.RADIUS)
         p.end()
         super().paintEvent(e)  # type: ignore[arg-type]
 
@@ -519,6 +588,7 @@ class AeroDialog(QDialog):
 
     def showEvent(self, e: object) -> None:
         theme.apply_titlebar(self)
+        self.setFixedSize(self.size().expandedTo(self.sizeHint()))  # фиксированный размер окна
         super().showEvent(e)  # type: ignore[arg-type]
 
 
