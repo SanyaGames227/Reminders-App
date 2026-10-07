@@ -108,15 +108,30 @@ class _FocusRing:
             paint_focus_ring(QPainter(self), QRectF(self.rect()), self.ring_radius)  # type: ignore[attr-defined]
 
 
+class _NoWheel:
+    """Миксин: колесо мыши не меняет значение (список, время, дату) и не забирает фокус — событие уходит
+    родителю, поэтому страница с прокруткой продолжает листаться, даже если курсор оказался над полем.
+    Менять значение можно кликом, а в полях времени/даты — ещё и стрелками клавиатуры.
+    У QComboBox и QAbstractSpinBox политика фокуса по умолчанию WheelFocus: колесо над ними выдаёт им фокус
+    (отсюда синее свечение/рамка при прокрутке). StrongFocus — только Tab и клик. Ставить ПЕРЕД Qt-классом."""
+
+    def __init__(self, *args: object, **kw: object) -> None:
+        super().__init__(*args, **kw)  # type: ignore[call-arg]
+        self.setFocusPolicy(Qt.StrongFocus)  # type: ignore[attr-defined]
+
+    def wheelEvent(self, e: object) -> None:
+        e.ignore()  # type: ignore[attr-defined]
+
+
 class AeroLineEdit(_FocusRing, QLineEdit):
     pass
 
 
-class AeroTimeEdit(_FocusRing, QTimeEdit):
+class AeroTimeEdit(_FocusRing, _NoWheel, QTimeEdit):
     pass
 
 
-class AeroDateEdit(_FocusRing, QDateEdit):
+class AeroDateEdit(_FocusRing, _NoWheel, QDateEdit):
     pass
 
 
@@ -409,6 +424,7 @@ class _ComboPopup(QWidget):
         self.combo = combo
         m = S.SHADOW
         self.top_m, self.bottom_m = (m, self.NEAR) if up else (self.NEAR, m)
+        self._bd = Backdrop(self, 8)            # размытый фон, как у AeroMenu: текст за списком не просвечивает
         lay = QVBoxLayout(self)
         lay.setContentsMargins(m + 4, self.top_m + 4, m + 4, self.bottom_m + 4)
         self.view = QListView(self)
@@ -431,17 +447,33 @@ class _ComboPopup(QWidget):
         self.combo.activated.emit(index.row())  # type: ignore[attr-defined]
         self.close()
 
+    def body(self) -> QRectF:
+        m = S.SHADOW
+        return QRectF(self.rect()).adjusted(m, self.top_m, -m, -self.bottom_m)
+
+    def showEvent(self, e: object) -> None:
+        super().showEvent(e)  # type: ignore[arg-type]
+        self._bd.prepare(self.pos())          # снимок экрана до того, как список появился на нём
+        if self._bd.mode == NATIVE:
+            self._bd.activate()               # KDE: размытие делает композитор
+
     def paintEvent(self, _e: object) -> None:
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
-        m = S.SHADOW
-        body = QRectF(self.rect()).adjusted(m, self.top_m, -m, -self.bottom_m)
+        body = self.body()
         theme.paint_shadow(p, body, 8)
-        p.setPen(QPen(theme.col("menu_edge"), 1)); p.setBrush(theme.col("menu"))
-        p.drawRoundedRect(body.adjusted(.5, .5, -.5, -.5), 8, 8)
+        r = body.adjusted(.5, .5, -.5, -.5)
+        pix = self._bd.pixmap()
+        if pix is not None:
+            p.setPen(Qt.NoPen); p.setBrushOrigin(body.topLeft()); p.setBrush(QBrush(pix))
+            p.drawRoundedRect(r, 8, 8)
+        fill = theme.col("menu"); fill.setAlpha(185 if self._bd.translucent() else 255)   # без размытия — плотная заливка
+        p.setPen(QPen(theme.col("menu_edge"), 1)); p.setBrush(fill)
+        p.drawRoundedRect(r, 8, 8)
 
     def hideEvent(self, e: object) -> None:
         super().hideEvent(e)  # type: ignore[arg-type]
+        self._bd.stop()
         self.combo._closed_at = time.monotonic()
         if self.combo._popup is self:
             self.combo._popup = None
@@ -449,7 +481,7 @@ class _ComboPopup(QWidget):
         self.combo.update()
 
 
-class AeroComboBox(_FocusRing, QComboBox):
+class AeroComboBox(_FocusRing, _NoWheel, QComboBox):
     def __init__(self, parent: Optional[QWidget] = None, editable: bool = False) -> None:
         super().__init__(parent)
         self.setEditable(editable)

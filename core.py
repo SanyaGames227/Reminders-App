@@ -26,9 +26,10 @@ UNDO_MS = 5000                          # время полосы «Отмени
 MANUAL, BY_TITLE, BY_DUE = "manual", "title", "due"   # режимы сортировки списка
 SORTS = (MANUAL, BY_TITLE, BY_DUE)
 HISTORY_KEEP_CHOICES = (0, 30, 90)      # 0 = никогда не очищать
-EARLY_CHOICES = (0, 5, 10, 15, 30, 60, 120, 1440)   # «напомнить заранее», минуты; 0 = выключено
+WEEK_MIN, MONTH_MIN = 7 * 1440, 30 * 1440            # «за неделю», «за месяц» (30 дней), в минутах
+EARLY_CHOICES = (0, 5, 10, 15, 30, 60, 120, 1440, WEEK_MIN, MONTH_MIN)   # «напомнить заранее», минуты; 0 = выключено
 EXPORT_FORMAT = "reminders-export"
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.0.2"
 GITHUB_URL = "https://github.com/SanyaGames227/Reminders-App"
 RELEASES_URL = GITHUB_URL + "/releases"
 RELEASES_API = "https://api.github.com/repos/SanyaGames227/Reminders-App/releases/latest"
@@ -52,6 +53,11 @@ def now_local() -> datetime:
 
 def next_full_hour(now: datetime) -> datetime:
     return now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+
+
+def week_morning(now: datetime) -> datetime:
+    """«На неделю»: ровно через 7 дней в то же утреннее время, что и «завтра»."""
+    return (now + timedelta(days=7)).replace(hour=TOMORROW_HOUR, minute=0, second=0, microsecond=0)
 
 
 def tomorrow_morning(now: datetime) -> datetime:
@@ -115,7 +121,7 @@ def _early(v: Any) -> int:
         n = int(v)
     except (TypeError, ValueError):
         return 0
-    return n if 0 < n <= 10080 else 0
+    return n if 0 < n <= MONTH_MIN else 0
 
 
 @dataclass
@@ -269,17 +275,34 @@ def acknowledge(r: Reminder) -> None:
     r.state = ACKNOWLEDGED
 
 
-def snooze(r: Reminder, until: datetime) -> None:
-    """Единая функция откладывания: due не меняется."""
+def window_start(r: Reminder) -> datetime:
+    """Момент, с которого напоминанием уже «можно заниматься»: «заранее» (если включено) или сам срок."""
+    return r.due - timedelta(minutes=r.early_min)
+
+
+def can_snooze(r: Reminder, until: datetime, now: datetime) -> bool:
+    """Откладывать можно, только когда подошло время напоминания либо его «заранее»-окно,
+    и только на время позже самого срока (откладка внутри окна «заранее» на более раннее время бессмысленна)."""
+    if now < window_start(r):
+        return False
+    return now >= r.due or until > r.due
+
+
+def snooze(r: Reminder, until: datetime, now: Optional[datetime] = None) -> bool:
+    """Единая функция откладывания: due не меняется. False — откладывать пока нельзя (ничего не изменено)."""
+    if not can_snooze(r, until, now or now_local()):
+        return False
     r.snoozed_until, r.state = until, SCHEDULED
-
-
-def is_overdue(r: Reminder, now: datetime) -> bool:
-    return r.due < now
+    return True
 
 
 def shown_snooze(r: Reminder, now: datetime) -> Optional[datetime]:
     return r.snoozed_until if r.snoozed_until and r.snoozed_until > now else None
+
+
+def is_overdue(r: Reminder, now: datetime) -> bool:
+    """Просрочено: срок прошёл, и напоминание сейчас не отложено."""
+    return r.due < now and shown_snooze(r, now) is None
 
 
 # ---- Предупреждение заранее и тихий режим -------------------------------------------------
@@ -287,15 +310,14 @@ def _pre_key(r: Reminder) -> str:
     return iso(r.due) or ""
 
 
-def mark_pre_if_late(r: Reminder, now: datetime) -> None:
-    """Если окно предупреждения уже началось (создали «впритык») — не показывать его задним числом."""
-    if r.early_min and r.due - timedelta(minutes=r.early_min) <= now:
-        r.pre_sent = _pre_key(r) + "!"
-
-
 def _in_early_window(r: Reminder, now: datetime) -> bool:
     return (r.state == SCHEDULED and r.snoozed_until is None and r.early_min > 0
             and r.due - timedelta(minutes=r.early_min) <= now < r.due)
+
+
+def pending_early(r: Reminder, now: datetime) -> bool:
+    """«Скоро» показано, но пользователь его ещё не закрыл, и окно всё ещё идёт."""
+    return _in_early_window(r, now) and r.pre_sent == _pre_key(r)
 
 
 def due_early(data: Data, now: datetime, include_unseen: bool = False) -> list[Reminder]:
@@ -414,7 +436,8 @@ def merge_import(data: Data, payload: Any) -> tuple[int, int]:
 
 # ---- Выполнено / удаление / правка -------------------------------------------------------
 def can_complete(r: Reminder, now: datetime) -> bool:
-    return r.repeat == ONCE or r.due <= now
+    """Однократное — всегда; повторяющееся — когда подошёл срок или начало «заранее»-окна."""
+    return r.repeat == ONCE or window_start(r) <= now
 
 
 def complete(data: Data, r: Reminder, now: datetime) -> Optional[HistoryItem]:
@@ -426,7 +449,7 @@ def complete(data: Data, r: Reminder, now: datetime) -> Optional[HistoryItem]:
         data.reminders.remove(r)
         _renumber(data)
     else:
-        r.due, r.snoozed_until, r.state = next_occurrence(r, now), None, SCHEDULED
+        r.due, r.snoozed_until, r.state = next_occurrence(r, max(now, r.due)), None, SCHEDULED   # выполнили до срока — следующее, а не это же
     return item
 
 
@@ -435,7 +458,6 @@ def add_reminder(data: Data, r: Reminder) -> None:
     r.cat_order = _next_cat_order(data, r.category)
     data.reminders.append(r)
     ensure_category(data, r.category)
-    mark_pre_if_late(r, now_local())
 
 
 def delete_reminder(data: Data, r: Reminder) -> int:
@@ -463,8 +485,6 @@ def apply_edit(data: Data, r: Reminder, *, title: str, description: str, categor
         r.state, r.snoozed_until, r.pre_sent = SCHEDULED, None, None
     if early_min != r.early_min:
         r.early_min, r.pre_sent = early_min, None
-    if r.state == SCHEDULED:
-        mark_pre_if_late(r, now_local())
 
 
 # ---- Список: фильтры, поиск, порядок -----------------------------------------------------

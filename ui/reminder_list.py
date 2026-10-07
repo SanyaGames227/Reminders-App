@@ -1,6 +1,7 @@
 """Список напоминаний и истории: самописные строки, Drag & Drop с линией вставки."""
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
@@ -74,6 +75,7 @@ class Row(QWidget):
         self.owner, self.model = owner, model
         self.selected = False
         self.dragging = False
+        self._pressed_at = 0.0               # когда последний раз нажали именно на эту строку
         self._hover = HoverAnim(self)
         self.setFixedHeight(ROW_SNOOZE if model.line2 else ROW_BASE)
         if model.kind == ACTIVE:
@@ -167,6 +169,7 @@ class Row(QWidget):
 
     def mousePressEvent(self, e: object) -> None:
         if e.button() == Qt.LeftButton:  # type: ignore[attr-defined]
+            self._pressed_at = time.monotonic()
             self.owner.row_pressed(self, e)
         elif e.button() == Qt.RightButton:  # type: ignore[attr-defined]
             self.owner.select(self.model.id)
@@ -179,6 +182,14 @@ class Row(QWidget):
         self.owner.row_released(self, e)
 
     def mouseDoubleClickEvent(self, e: object) -> None:
+        """Двойной клик — только если ПЕРВОЕ нажатие тоже пришлось на эту строку. Иначе (первый клик был,
+        например, по «Отмена» закрывающегося диалога, а второй упал на строку под ним) это обычное нажатие."""
+        if e.button() != Qt.LeftButton:  # type: ignore[attr-defined]
+            return
+        first_here = time.monotonic() - self._pressed_at <= QApplication.doubleClickInterval() / 1000 + .1
+        self._pressed_at = 0.0
+        if not first_here:
+            self.mousePressEvent(e); return          # как обычный клик: выделить
         if self.model.kind == ACTIVE:
             self.act.emit("edit", self.model.id)
 
@@ -241,7 +252,6 @@ class ReminderList(QScrollArea):
         self._checked: set[str] = set()
         self.drag_enabled = False
         self._press: Optional[Row] = None
-        self._press_was_selected = False
         self._press_pos = QPoint()
         self._dragging = False
         self._ghost: Optional[QLabel] = None
@@ -347,7 +357,6 @@ class ReminderList(QScrollArea):
     # -- Drag & Drop
     def row_pressed(self, row: Row, e: object) -> None:
         self._press, self._press_pos = row, e.globalPos()  # type: ignore[attr-defined]
-        self._press_was_selected = self._selected == row.model.id
         self.select(row.model.id)
         self.setFocus()
 
@@ -408,8 +417,6 @@ class ReminderList(QScrollArea):
             self._cancel_drag()
             if new != old:
                 self.reordered.emit(new)
-        elif self._press is row and self._press_was_selected and row.rect().contains(e.pos()):  # type: ignore[attr-defined]
-            self.select(None)          # повторный клик по выделенной строке снимает выделение
         self._press = None
 
     def _cancel_drag(self) -> None:

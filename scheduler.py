@@ -28,6 +28,7 @@ class Scheduler(QObject):
         self._last_minute: Optional[datetime] = None
         self._last_purge_day = None
         self._held: list[str] = []          # id обычных напоминаний, задержанных тихим режимом
+        self._held_early: list[str] = []    # то же для «скоро»: не пропускаем, а показываем после тихих часов
 
     def start(self) -> None:
         """Старт программы: показать все alerting и наступившие scheduled — одной пачкой."""
@@ -62,6 +63,12 @@ class Scheduler(QObject):
             late = [r for r in (self.store.data.get(i) for i in ids) if r is not None and r.state == core.ALERTING]
             if late:
                 self._notify(late)
+        if self._held_early and not self._quiet(now):
+            ids, self._held_early = self._held_early, []
+            soon = [r for r in (self.store.data.get(i) for i in ids)
+                    if r is not None and core.pending_early(r, now)]
+            if soon:
+                self._deliver_early(soon, now)
         minute = now.replace(second=0)
         if minute != self._last_minute:     # смена минуты (в т.ч. после сна/перевода часов)
             self._last_minute = minute
@@ -94,11 +101,8 @@ class Scheduler(QObject):
         self._notify(items)
 
     def _deliver_early(self, items: list[Reminder], now: datetime) -> None:
-        if self._quiet(now):
-            for r in items:
-                if r.priority != HIGH:
-                    core.ack_early(r)                            # обычные «скоро» в тихие часы пропускаем
-            self.store.save_data()
+        if self._quiet(now):                                     # обычные «скоро» ждут конца тихих часов (не закрыты — не теряются)
+            self._held_early.extend(r.id for r in items if r.priority != HIGH and r.id not in self._held_early)
             items = [r for r in items if r.priority == HIGH]
         if not items:
             return

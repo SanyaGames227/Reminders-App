@@ -2,12 +2,13 @@
 from __future__ import annotations
 
 import sqlite3
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Optional
 
 from PyQt5.QtCore import QByteArray, QObject, QPoint, QRectF, QSize, Qt, QTimer, pyqtSignal
-from PyQt5.QtGui import QBrush, QFontMetrics, QImage, QKeySequence, QPainter, QPixmap, QRegion
+from PyQt5.QtGui import QBrush, QCursor, QFontMetrics, QImage, QKeySequence, QPainter, QPainterPath, QPixmap, QRegion
 from PyQt5.QtWidgets import (QAbstractButton, QApplication, QDialog, QFileDialog, QHBoxLayout, QLabel, QMainWindow,
                              QScrollArea, QShortcut, QStackedWidget, QVBoxLayout, QWidget)
 
@@ -237,8 +238,10 @@ class UndoBar(QWidget):
         self._cb: Optional[Callable[[], None]] = None
         self.btn = AeroButton("", "accent", self, compact=True)
         self.btn.clicked.connect(self._undo)
-        self._timer = QTimer(self); self._timer.setSingleShot(True); self._timer.setInterval(core.UNDO_MS)
-        self._timer.timeout.connect(self.hide)
+        self._timer = QTimer(self); self._timer.setInterval(30)      # отсчёт; на паузе (курсор над плашкой) не идёт
+        self._timer.timeout.connect(self._countdown)
+        self._left = float(core.UNDO_MS)                             # осталось, мс
+        self._last = 0.0
         self._pix: Optional[QPixmap] = None                # размытое содержимое окна под плашкой
         self._blur_on = detect_mode() != SOLID
         self._blur_timer = QTimer(self); self._blur_timer.setInterval(100)   # список под плашкой может прокручиваться
@@ -272,11 +275,27 @@ class UndoBar(QWidget):
         self._text, self._cb = text, undo
         self.btn.setText(i18n.tr("undo")); self.btn.adjustSize()
         self.btn.move(self.width() - 12 - self.btn.width(), (self.height() - self.btn.height()) // 2)
+        self._left, self._last = float(core.UNDO_MS), time.monotonic()
         self.show(); self.raise_(); self._timer.start()
         self._refresh_blur(); self._blur_timer.start()
 
+    def _hovered(self) -> bool:
+        # underMouse() не годится: кнопка внутри плашки перехватывает Enter/Leave
+        return self.rect().contains(self.mapFromGlobal(QCursor.pos()))
+
+    def _countdown(self) -> None:
+        now = time.monotonic()
+        paused = self._hovered()
+        if not paused:
+            self._left -= (now - self._last) * 1000
+        self._last = now
+        if self._left <= 0:
+            self._timer.stop(); self.hide(); self._cb = None
+            return
+        self.update()
+
     def hideEvent(self, e: object) -> None:
-        self._blur_timer.stop(); self._pix = None
+        self._blur_timer.stop(); self._timer.stop(); self._pix = None
         super().hideEvent(e)  # type: ignore[arg-type]
 
     def _undo(self) -> None:
@@ -293,6 +312,15 @@ class UndoBar(QWidget):
             p.setBrush(QBrush(self._pix)); p.drawRoundedRect(r.adjusted(.5, .5, -.5, -.5), S.R_PANEL, S.R_PANEL)
         fill = theme.col("menu"); fill.setAlpha(150 if self._pix is not None else 255)
         theme.paint_glass_panel(p, r, fill=fill)
+        k = max(0.0, min(1.0, self._left / core.UNDO_MS))
+        if k > 0:                                          # полоска оставшегося времени вдоль нижней кромки
+            p.save(); p.setRenderHint(QPainter.Antialiasing)
+            clip = QPainterPath(); clip.addRoundedRect(r.adjusted(.5, .5, -.5, -.5), S.R_PANEL, S.R_PANEL)
+            p.setClipPath(clip)
+            bar = theme.col("accent"); bar.setAlpha(210 if not self._hovered() else 140)   # на паузе — приглушена
+            p.setPen(Qt.NoPen); p.setBrush(bar)
+            p.drawRect(QRectF(r.left(), r.bottom() - 3, r.width() * k, 3))
+            p.restore()
         p.setPen(theme.col("text"))
         p.drawText(QRectF(16, 0, self.width() - 120, self.height()), Qt.AlignVCenter | Qt.AlignLeft, self._text)
 
@@ -633,8 +661,7 @@ class MainWindow(QMainWindow):
 
     def snooze(self, rid: str, until: datetime) -> None:
         r = self.data.get(rid)
-        if r:
-            core.snooze(r, until)
+        if r and core.snooze(r, until):
             self._commit(dismiss=rid)
 
     def on_context(self, rid: str, pos: QPoint) -> None:
@@ -652,10 +679,16 @@ class MainWindow(QMainWindow):
         now = core.now_local()
         menu.addAction(tr("edit"), lambda: self.on_edit(rid), QKeySequence(Qt.Key_Return))
         sub = AeroMenu(tr("snooze"), menu); menu.addMenu(sub)
-        sub.addAction(tr("snooze_10"), lambda: self.snooze(rid, core.now_local() + core.SNOOZE_SHORT))
-        sub.addAction(tr("snooze_1h"), lambda: self.snooze(rid, core.now_local() + core.SNOOZE_LONG))
         t = i18n.fmt_time(datetime(2000, 1, 1, core.TOMORROW_HOUR))
-        sub.addAction(tr("snooze_tomorrow", time=t), lambda: self.snooze(rid, core.tomorrow_morning(core.now_local())))
+        any_snooze = False
+        for label, calc in ((tr("snooze_10"), lambda n: n + core.SNOOZE_SHORT),
+                            (tr("snooze_1h"), lambda n: n + core.SNOOZE_LONG),
+                            (tr("snooze_tomorrow", time=t), core.tomorrow_morning),
+                            (tr("snooze_week"), core.week_morning)):
+            act = sub.addAction(label, lambda calc=calc: self.snooze(rid, calc(core.now_local())))
+            act.setEnabled(core.can_snooze(r, calc(now), now))     # рано: ни срок, ни «заранее» ещё не наступили
+            any_snooze = any_snooze or act.isEnabled()
+        sub.menuAction().setEnabled(any_snooze)
         done = menu.addAction(tr("done"), lambda: self.on_done(rid))
         done.setEnabled(core.can_complete(r, now))
         menu.addSeparator()

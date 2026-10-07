@@ -33,6 +33,7 @@ class ReminderDialog(AeroDialog):
         loc = i18n.qlocale()
         now = core.now_local()
         due = reminder.due if reminder else core.next_full_hour(now)
+        self._orig = (reminder.due, reminder.early_min) if reminder else None
 
         self.title = AeroLineEdit(reminder.title if reminder else "")
         self.title.setPlaceholderText(tr("title_ph"))
@@ -101,6 +102,7 @@ class ReminderDialog(AeroDialog):
         grid.addLayout(brow, r + 4, 0, 1, 2)
 
         self.date.dateChanged.connect(self._update_hint); self.time.timeChanged.connect(self._update_hint)
+        self.early.currentIndexChanged.connect(self._update_hint)
         self.title.textChanged.connect(self._clear_invalid)
         chain = (self.title, self.desc, self.category, self.priority, self.repeat, self.early, self.date,
                  self.time, self.silent, today, tomorrow, cancel, self.ok)
@@ -119,7 +121,11 @@ class ReminderDialog(AeroDialog):
         return datetime(d.year(), d.month(), d.day(), t.hour(), t.minute())
 
     def _update_hint(self) -> None:
-        self.hint.setText(i18n.tr("fires_now") if self._due() <= core.now_local() else "")
+        due, now, early = self._due(), core.now_local(), self.early.currentData() or 0
+        fires = due <= now
+        if not fires and early and due - timedelta(minutes=early) <= now:      # окно «заранее» уже началось
+            fires = self._orig != (due, early)       # при правке без смены срока и «заранее» — ничего нового
+        self.hint.setText(i18n.tr("fires_now") if fires else "")
 
     def _clear_invalid(self) -> None:
         if self.title.property("invalid"):

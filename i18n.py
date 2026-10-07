@@ -34,7 +34,7 @@ EN: dict[str, Val] = {
     "n_reminders": ("{n} reminder", "{n} reminders"),
     "snoozed_until": "Snoozed until {when}",
     "snooze": "Snooze", "snooze_10": "10 minutes", "snooze_1h": "1 hour",
-    "snooze_tomorrow": "Tomorrow, {time}", "plus_min": "+{n} min", "plus_hour": "+{n} h",
+    "snooze_tomorrow": "Tomorrow, {time}", "snooze_week": "1 week", "plus_min": "+{n} min", "plus_hour": "+{n} h",
     "toast_more": "+{n} more",
     "d_today": "Today", "d_tomorrow": "Tomorrow", "d_yesterday": "Yesterday",
     "f_title": "Title", "f_desc": "Description", "f_category": "Category",
@@ -76,7 +76,7 @@ EN: dict[str, Val] = {
     "err_autostart": "Could not change the startup setting.",
     "f_early": "Remind early", "early_none": "No", "early_before": "{t} before",
     "early_toast": "In {t} — {when}", "f_silent": "No sound for this reminder", "early_chip": "{t} early",
-    "unit_min": "min", "unit_hour": "h", "unit_day": "d",
+    "unit_min": "min", "unit_hour": "h", "unit_day": "d", "unit_week": "wk", "unit_month": "mo",
     "sec_quiet": "Quiet mode", "set_quiet": "Quiet hours (normal priority only)",
     "set_quiet_from": "From", "set_quiet_to": "Until",
     "sec_data": "Data", "set_data": "Backup", "data_export": "Export…", "data_import": "Import…",
@@ -111,7 +111,7 @@ RU: dict[str, Val] = {
     "n_reminders": ("{n} напоминание", "{n} напоминания", "{n} напоминаний"),
     "snoozed_until": "Отложено до: {when}",
     "snooze": "Отложить", "snooze_10": "10 минут", "snooze_1h": "1 час",
-    "snooze_tomorrow": "Завтра, {time}", "plus_min": "+{n} мин", "plus_hour": "+{n} ч",
+    "snooze_tomorrow": "Завтра, {time}", "snooze_week": "1 неделя", "plus_min": "+{n} мин", "plus_hour": "+{n} ч",
     "toast_more": "+{n} ещё",
     "d_today": "Сегодня", "d_tomorrow": "Завтра", "d_yesterday": "Вчера",
     "f_title": "Название", "f_desc": "Описание", "f_category": "Категория",
@@ -153,7 +153,7 @@ RU: dict[str, Val] = {
     "err_autostart": "Не удалось изменить настройку автозапуска.",
     "f_early": "Напомнить заранее", "early_none": "Нет", "early_before": "за {t}",
     "early_toast": "Через {t} — {when}", "f_silent": "Без звука для этого напоминания", "early_chip": "заранее: {t}",
-    "unit_min": "мин", "unit_hour": "ч", "unit_day": "дн",
+    "unit_min": "мин", "unit_hour": "ч", "unit_day": "дн", "unit_week": "нед", "unit_month": "мес",
     "sec_quiet": "Тихий режим", "set_quiet": "Тихие часы (только обычный приоритет)",
     "set_quiet_from": "С", "set_quiet_to": "До",
     "sec_data": "Данные", "set_data": "Резервная копия", "data_export": "Экспорт…", "data_import": "Импорт…",
@@ -188,7 +188,7 @@ UK: dict[str, Val] = {
     "n_reminders": ("{n} нагадування", "{n} нагадування", "{n} нагадувань"),
     "snoozed_until": "Відкладено до: {when}",
     "snooze": "Відкласти", "snooze_10": "10 хвилин", "snooze_1h": "1 година",
-    "snooze_tomorrow": "Завтра, {time}", "plus_min": "+{n} хв", "plus_hour": "+{n} год",
+    "snooze_tomorrow": "Завтра, {time}", "snooze_week": "1 тиждень", "plus_min": "+{n} хв", "plus_hour": "+{n} год",
     "toast_more": "+{n} ще",
     "d_today": "Сьогодні", "d_tomorrow": "Завтра", "d_yesterday": "Вчора",
     "f_title": "Назва", "f_desc": "Опис", "f_category": "Категорія",
@@ -230,7 +230,7 @@ UK: dict[str, Val] = {
     "err_autostart": "Не вдалося змінити налаштування автозапуску.",
     "f_early": "Нагадати заздалегідь", "early_none": "Ні", "early_before": "за {t}",
     "early_toast": "Через {t} — {when}", "f_silent": "Без звуку для цього нагадування", "early_chip": "заздалегідь: {t}",
-    "unit_min": "хв", "unit_hour": "год", "unit_day": "дн",
+    "unit_min": "хв", "unit_hour": "год", "unit_day": "дн", "unit_week": "тиж", "unit_month": "міс",
     "sec_quiet": "Тихий режим", "set_quiet": "Тихі години (лише звичайний пріоритет)",
     "set_quiet_from": "З", "set_quiet_to": "До",
     "sec_data": "Дані", "set_data": "Резервна копія", "data_export": "Експорт…", "data_import": "Імпорт…",
@@ -275,6 +275,10 @@ def unsubscribe(cb: Callable[[], None]) -> None:
 
 def lead_label(minutes: int) -> str:
     """«15 мин», «2 ч», «1 дн» — для «напомнить заранее»."""
+    if minutes == 30 * 1440:
+        return f"1 {tr('unit_month')}"
+    if minutes % 10080 == 0:
+        return f"{minutes // 10080} {tr('unit_week')}"
     if minutes % 1440 == 0:
         return f"{minutes // 1440} {tr('unit_day')}"
     if minutes % 60 == 0:
